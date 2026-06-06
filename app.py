@@ -141,6 +141,7 @@ _PIVOT_PATHS_TO_RESTORE = (
     "xl/pivotTables/",
     "xl/worksheets/sheet1.xml",
     "xl/worksheets/_rels/sheet1.xml.rels",
+    "xl/sharedStrings.xml",  # tabela_dinamica e pivot referenciam strings por índice
 )
 
 
