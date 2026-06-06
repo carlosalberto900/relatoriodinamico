@@ -59,8 +59,8 @@ st.set_page_config(
 
 st.title("⚖️ Relatório Dinâmico — Acervo PJe")
 st.caption(
-    "Envie o xlsx exportado do PJe (Relação do Acervo da Vara, obtido em Relatórios Gerenciais - cód. 277). "
-    "O app calcula data mínima, entre data da última movimentação e data de ingresso na tarefa, gerando um relatório com tabela dinâmica."
+    "Envie o xlsx exportado do PJe (Relação do Acervo da Vara). "
+    "O app calcula `data_mínima` e gera um relatório com tabela dinâmica."
 )
 
 TEMPLATE_PATH = Path(__file__).parent / "template.xlsx"
@@ -105,7 +105,7 @@ def _detect_header(file_bytes: bytes) -> tuple[int, str]:
     if header_row is None:
         raise ValueError(
             "Não foi possível localizar o cabeçalho. "
-            "Verifique se o arquivo é a 'Relação do Acervo da Vara' do PJe - Relatórios Gerenciais 277."
+            "Verifique se o arquivo é a 'Relação do Acervo da Vara' do PJe."
         )
     return header_row, sheet_name
 
@@ -134,31 +134,70 @@ def carregar(file_bytes: bytes) -> pd.DataFrame:
 HEADER_ROW = 14  # linha do cabeçalho na aba "Relatório" do template
 
 
-def _patch_pivot_refresh(xlsx_bytes: bytes) -> bytes:
-    """Marca a Tabela Dinâmica para atualizar ao abrir o arquivo no Excel."""
+# Arquivos do template que o openpyxl mutila ao salvar — restauramos direto
+# do zip original para preservar a Tabela Dinâmica (cache + pivot + aba).
+_PIVOT_PATHS_TO_RESTORE = (
+    "xl/pivotCache/",
+    "xl/pivotTables/",
+    "xl/worksheets/sheet1.xml",
+    "xl/worksheets/_rels/sheet1.xml.rels",
+)
+
+
+def _is_pivot_path(name: str) -> bool:
+    return any(name.startswith(p) for p in _PIVOT_PATHS_TO_RESTORE)
+
+
+def _patch_pivot_refresh(xlsx_bytes: bytes, template_bytes: bytes) -> bytes:
+    """Restaura os arquivos do pivot a partir do template (openpyxl descarta
+    campos do cache ao salvar) e marca refreshOnLoad=1 no cache."""
+    # Lê os arquivos do pivot direto do template, intactos
+    template_pivot_files: dict[str, bytes] = {}
+    template_extras: list[str] = []
+    with zipfile.ZipFile(BytesIO(template_bytes)) as tpl:
+        for n in tpl.namelist():
+            if _is_pivot_path(n):
+                template_pivot_files[n] = tpl.read(n)
+                template_extras.append(n)
+
     src = BytesIO(xlsx_bytes)
     dst = BytesIO()
+    written: set[str] = set()
     with zipfile.ZipFile(src) as zin, zipfile.ZipFile(
         dst, "w", zipfile.ZIP_DEFLATED
     ) as zout:
         for item in zin.infolist():
-            data = zin.read(item.filename)
-            if item.filename.startswith("xl/pivotCache/pivotCacheDefinition"):
-                text = data.decode("utf-8")
-                if "refreshOnLoad=" not in text:
-                    text = text.replace(
-                        "<pivotCacheDefinition ",
-                        '<pivotCacheDefinition refreshOnLoad="1" ',
-                        1,
-                    )
-                data = text.encode("utf-8")
-            elif item.filename.startswith("xl/pivotTables/pivotTable"):
-                text = data.decode("utf-8")
-                # Garante atualização nas abas
-                if 'updatedVersion="' in text and "refreshOnLoad=" not in text:
-                    pass  # já tratado via cache
-                data = text.encode("utf-8")
+            name = item.filename
+            if _is_pivot_path(name) and name in template_pivot_files:
+                data = template_pivot_files[name]
+                if name.startswith("xl/pivotCache/pivotCacheDefinition"):
+                    t = data.decode("utf-8")
+                    if "refreshOnLoad=" not in t:
+                        t = t.replace(
+                            "<pivotCacheDefinition ",
+                            '<pivotCacheDefinition refreshOnLoad="1" ',
+                            1,
+                        )
+                    data = t.encode("utf-8")
+            else:
+                data = zin.read(name)
             zout.writestr(item, data)
+            written.add(name)
+
+        # Inclui arquivos do template que o openpyxl removeu (rels, etc.)
+        for n, data in template_pivot_files.items():
+            if n not in written:
+                if n.startswith("xl/pivotCache/pivotCacheDefinition"):
+                    t = data.decode("utf-8")
+                    if "refreshOnLoad=" not in t:
+                        t = t.replace(
+                            "<pivotCacheDefinition ",
+                            '<pivotCacheDefinition refreshOnLoad="1" ',
+                            1,
+                        )
+                    data = t.encode("utf-8")
+                zout.writestr(n, data)
+
     return dst.getvalue()
 
 
@@ -170,7 +209,8 @@ def gerar_xlsx(df_acervo: pd.DataFrame) -> bytes:
             "Coloque o template ao lado de app.py."
         )
 
-    wb = load_workbook(TEMPLATE_PATH)
+    template_bytes = TEMPLATE_PATH.read_bytes()
+    wb = load_workbook(BytesIO(template_bytes))
     ws = wb["Relatório"]
 
     # Cabeçalho do template
@@ -229,10 +269,11 @@ def gerar_xlsx(df_acervo: pd.DataFrame) -> bytes:
         if tbl.autoFilter is not None:
             tbl.autoFilter.ref = new_ref
 
-    # Salva e marca o pivot para atualizar
+    # Salva e restaura os arquivos do pivot a partir do template (o openpyxl
+    # não preserva todos os campos do cache da Tabela Dinâmica).
     buf = BytesIO()
     wb.save(buf)
-    return _patch_pivot_refresh(buf.getvalue())
+    return _patch_pivot_refresh(buf.getvalue(), template_bytes)
 
 
 # ---------------------------------------------------------------------------
